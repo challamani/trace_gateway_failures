@@ -1,211 +1,347 @@
-# trace_gateway_failures
+# Trace Gateway Failures
 
-MCP Server to retrieve Gateway logs and metrics to identify traffic failures. This server implements the Model Context Protocol (MCP) and provides tools to retrieve Kubernetes pod logs for analyzing where incoming traffic might be failing in your gateway infrastructure.
+A comprehensive tool for tracing and diagnosing gateway failures in Kubernetes environments with support for Istio service mesh and advanced pod log collection.
 
 ## Features
 
-- **MCP Protocol Support**: Implements the Model Context Protocol for seamless integration with MCP clients
-- **Kubernetes Integration**: Uses the Kubernetes Go client library to interact with clusters
-- **Local Kubeconfig**: Automatically uses your local `~/.kube/config` for cluster authentication
-- **Flexible Filtering**: Filter pods by namespaces and deployment names
-- **Comprehensive Logging**: Retrieve logs from all matching pods and containers
-- **Gateway Failure Analysis**: Designed to help trace where incoming traffic is failing across your infrastructure
+- **Advanced Pod Log Collection**: Retrieve logs from multiple namespaces and deployments in a single request
+- **Init Container Support**: Automatically detects and labels init container logs with `[INIT]` prefix
+- **Istio Service Mesh Integration**: Captures istio-proxy sidecar logs for complete traffic visibility
+- **Flexible Configuration**: Configure tail lines per target and historical log retrieval globally
+- **Multi-Deployment Support**: Query logs from multiple deployments across different namespaces simultaneously
 
-## Prerequisites
+## API Documentation
 
-- Go 1.21 or later
-- Access to a Kubernetes cluster
-- Valid kubeconfig file at `~/.kube/config`
-- Appropriate RBAC permissions to list pods and read logs in target namespaces
+### get_pod_logs Endpoint
+
+The `get_pod_logs` API endpoint accepts a structured request to fetch logs from multiple Kubernetes pods across different namespaces and deployments.
+
+#### API Structure
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "string",
+      "deployments": ["string"],
+      "tail_lines": integer
+    }
+  ],
+  "previous": boolean
+}
+```
+
+#### Parameters
+
+- **targets** (array, required): An array of target objects defining which pods to query
+  - **namespace** (string, required): The Kubernetes namespace to query
+  - **deployments** (array of strings, required): List of deployment names within the namespace
+  - **tail_lines** (integer, optional): Number of log lines to retrieve per container (default: 100)
+
+- **previous** (boolean, optional): Global parameter to retrieve logs from previous/terminated containers (default: false)
+
+#### Request Examples
+
+##### Basic Single Namespace Query
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway", "auth-service"],
+      "tail_lines": 200
+    }
+  ]
+}
+```
+
+##### Multi-Namespace Query with Different Tail Lines
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway"],
+      "tail_lines": 500
+    },
+    {
+      "namespace": "staging",
+      "deployments": ["api-gateway", "payment-service"],
+      "tail_lines": 100
+    }
+  ],
+  "previous": false
+}
+```
+
+##### Query with Previous Container Logs
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway"]
+    }
+  ],
+  "previous": true
+}
+```
+
+#### Response Structure
+
+The response includes logs from all containers in the specified pods, including:
+- **Application containers**: Standard container logs
+- **Init containers**: Labeled with `[INIT]` prefix
+- **Istio sidecar containers**: istio-proxy logs when Istio is enabled
+
+##### Example Response
+
+```json
+{
+  "logs": {
+    "production": {
+      "api-gateway-7d8f9c5b6-x4k2m": {
+        "[INIT] istio-init": [
+          "2025-12-30T13:10:15Z Initializing iptables rules",
+          "2025-12-30T13:10:16Z iptables configuration completed successfully"
+        ],
+        "api-gateway": [
+          "2025-12-30T13:10:30Z Server started on port 8080",
+          "2025-12-30T13:11:00Z Processing request GET /api/v1/status",
+          "2025-12-30T13:11:45Z Error: Connection timeout to backend service"
+        ],
+        "istio-proxy": [
+          "2025-12-30T13:10:20Z Envoy proxy initialized",
+          "2025-12-30T13:11:00Z [outbound] upstream connect error: connection timeout",
+          "2025-12-30T13:11:45Z [inbound] request failed with status 504"
+        ]
+      },
+      "api-gateway-7d8f9c5b6-y9p3n": {
+        "[INIT] istio-init": [
+          "2025-12-30T13:09:45Z Initializing iptables rules"
+        ],
+        "api-gateway": [
+          "2025-12-30T13:10:00Z Server started on port 8080",
+          "2025-12-30T13:10:30Z Health check passed"
+        ],
+        "istio-proxy": [
+          "2025-12-30T13:09:50Z Envoy proxy initialized",
+          "2025-12-30T13:10:00Z Listener warming complete"
+        ]
+      }
+    }
+  },
+  "errors": []
+}
+```
+
+## Container Type Identification
+
+### Init Containers
+
+Init containers run before the main application container starts. Logs from init containers are automatically identified and prefixed with `[INIT]` for easy identification.
+
+**Example:**
+```
+[INIT] istio-init: Initializing iptables rules
+[INIT] config-loader: Loading configuration from ConfigMap
+```
+
+### Istio Proxy Sidecar
+
+When running in an Istio service mesh, the `istio-proxy` container logs provide valuable insights into:
+- Inbound and outbound traffic
+- Service mesh configuration
+- Connection errors and timeouts
+- TLS/mTLS handshake issues
+- Circuit breaker activations
+
+**Example istio-proxy logs:**
+```
+2025-12-30T13:11:00Z [outbound] upstream connect error: connection timeout
+2025-12-30T13:11:45Z [inbound] request failed with status 504
+2025-12-30T13:12:00Z TLS handshake failed: certificate validation error
+```
+
+## Migration Guide
+
+### Migrating from Previous API Version
+
+If you're using an older version of this API, here's how to migrate to the new `targets` array structure:
+
+#### Old API Format (Deprecated)
+
+```json
+{
+  "namespace": "production",
+  "deployments": ["api-gateway", "auth-service"],
+  "tail_lines": 200,
+  "previous": false
+}
+```
+
+#### New API Format
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway", "auth-service"],
+      "tail_lines": 200
+    }
+  ],
+  "previous": false
+}
+```
+
+### Key Changes
+
+1. **targets array**: All namespace/deployment configurations are now wrapped in a `targets` array
+2. **previous parameter**: Moved to the root level as a global parameter affecting all targets
+3. **Multiple namespaces**: You can now query multiple namespaces in a single request
+
+### Migration Benefits
+
+- **Batch Operations**: Query multiple namespaces simultaneously
+- **Flexible Configuration**: Set different tail_lines per namespace/deployment group
+- **Better Organization**: Clearer structure for complex queries
+- **Backward Compatibility**: Single-namespace queries are still simple with one target object
+
+## Use Cases
+
+### Debugging Gateway Timeouts
+
+When experiencing gateway timeouts, query both the gateway and backend service logs along with Istio proxy logs:
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway", "backend-service"],
+      "tail_lines": 500
+    }
+  ],
+  "previous": false
+}
+```
+
+Look for:
+- Connection timeout errors in application logs
+- Upstream connection errors in istio-proxy logs
+- Init container failures that might prevent proper startup
+
+### Cross-Environment Comparison
+
+Compare behavior across different environments:
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["api-gateway"],
+      "tail_lines": 300
+    },
+    {
+      "namespace": "staging",
+      "deployments": ["api-gateway"],
+      "tail_lines": 300
+    }
+  ]
+}
+```
+
+### Investigating Crashed Pods
+
+When pods are crash-looping, retrieve logs from previous containers:
+
+```json
+{
+  "targets": [
+    {
+      "namespace": "production",
+      "deployments": ["problematic-service"],
+      "tail_lines": 1000
+    }
+  ],
+  "previous": true
+}
+```
 
 ## Installation
-
-### Build from Source
 
 ```bash
 # Clone the repository
 git clone https://github.com/challamani/trace_gateway_failures.git
+
+# Navigate to the project directory
 cd trace_gateway_failures
 
-# Build the server
-go build -o mcp-server .
-
-# Run the server
-./mcp-server
-```
-
-### Direct Run
-
-```bash
-go run main.go
-```
-
-## Usage
-
-The MCP server communicates via stdin/stdout using the JSON-RPC 2.0 protocol. It can be integrated with any MCP client.
-
-### Available Tools
-
-#### `get_pod_logs`
-
-Retrieves pod logs for given namespaces and deployment names to trace gateway failures.
-
-**Parameters:**
-
-- `namespaces` (array of strings, required): List of Kubernetes namespaces to search for pods
-- `deployments` (array of strings, optional): List of deployment names to filter pods. If not provided, all pods in the namespace are included
-- `tail_lines` (integer, optional, default: 100): Number of lines from the end of the logs to retrieve
-- `previous` (boolean, optional, default: false): Retrieve logs from previous terminated container
-
-**Example Request:**
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "get_pod_logs",
-    "arguments": {
-      "namespaces": ["default", "kube-system"],
-      "deployments": ["nginx", "gateway"],
-      "tail_lines": 200,
-      "previous": false
-    }
-  }
-}
-```
-
-**Example Response:**
-
-The tool returns formatted logs showing:
-- Namespace and pod information
-- Pod status and owner references (Deployment/ReplicaSet)
-- Logs from each container in the pod
-- Clear separation between different pods and containers
-
-## MCP Protocol Support
-
-The server implements the following MCP methods:
-
-- `initialize`: Initialize the MCP connection
-- `tools/list`: List available tools
-- `tools/call`: Execute a specific tool
-
-## Architecture
-
-```
-main.go
-└── pkg/mcp/
-    └── server.go
-        ├── Server: Main server structure
-        ├── StdioTransport: Handles stdio communication
-        ├── InitializeKubeClient(): Initializes Kubernetes client
-        ├── Start(): Starts the server loop
-        ├── handleRequest(): Routes MCP requests
-        └── getPodLogs(): Retrieves and formats pod logs
-```
-
-## Use Case: Tracing Gateway Failures
-
-This tool is designed to help identify where incoming traffic is failing in your Kubernetes infrastructure:
-
-1. **Multi-Hop Analysis**: Check logs across multiple namespaces to trace the request path
-2. **Deployment Filtering**: Focus on specific gateway deployments (e.g., ingress controllers, API gateways)
-3. **Error Pattern Detection**: Review logs from multiple pods to identify common failure patterns
-4. **Recent History**: Use `tail_lines` to focus on recent events
-5. **Crash Analysis**: Use `previous: true` to examine logs from crashed containers
-
-### Example Workflow
-
-```bash
-# Check gateway and upstream service logs
-echo '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "get_pod_logs",
-    "arguments": {
-      "namespaces": ["ingress-nginx", "api-gateway", "backend-services"],
-      "deployments": ["nginx-ingress", "api-gateway", "user-service"],
-      "tail_lines": 500
-    }
-  }
-}' | ./mcp-server
+# Install dependencies
+pip install -r requirements.txt
 ```
 
 ## Configuration
 
-The server uses the default kubeconfig location (`~/.kube/config`). No additional configuration is required as it runs on localhost and uses local kubeconfig for cluster authentication.
-
-### RBAC Requirements
-
-Ensure your kubeconfig user has the following permissions:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: pod-logs-reader
-rules:
-- apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list"]
-```
-
-## Development
-
-### Project Structure
-
-- `main.go`: Entry point for the MCP server
-- `pkg/mcp/server.go`: Core MCP server implementation with Kubernetes integration
-- `go.mod`: Go module dependencies
-
-### Dependencies
-
-- `k8s.io/client-go`: Kubernetes Go client library
-- `k8s.io/api`: Kubernetes API types
-- `k8s.io/apimachinery`: Kubernetes API machinery
-
-### Testing
-
-To test the server manually:
+Configure your Kubernetes context to point to the cluster you want to monitor:
 
 ```bash
-# Start the server
-./mcp-server
-
-# In another terminal, send requests via stdin
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ./mcp-server
+kubectl config use-context <your-cluster-context>
 ```
+
+## Usage
+
+```bash
+# Start the service
+python app.py
+
+# Make API requests
+curl -X POST http://localhost:8080/get_pod_logs \
+  -H "Content-Type: application/json" \
+  -d @request.json
+```
+
+## Best Practices
+
+1. **Start with reasonable tail_lines**: Begin with 100-500 lines to avoid overwhelming output
+2. **Use previous flag judiciously**: Only enable when investigating crashes or restarts
+3. **Check istio-proxy logs**: Always review sidecar logs for network-related issues
+4. **Watch for [INIT] logs**: Init container failures can prevent pods from starting
+5. **Batch related services**: Query related services together for correlation analysis
 
 ## Troubleshooting
 
-### "Failed to initialize Kubernetes client"
+### No logs returned
 
-- Ensure your kubeconfig file exists at `~/.kube/config`
-- Verify the kubeconfig is valid and points to an accessible cluster
-- Check that you have network connectivity to the cluster
+- Verify the namespace and deployment names are correct
+- Check that pods are running: `kubectl get pods -n <namespace>`
+- Ensure your Kubernetes context has proper RBAC permissions
 
-### "Error listing pods in namespace X"
+### Missing istio-proxy logs
 
-- Verify the namespace exists: `kubectl get namespace`
-- Check RBAC permissions for your user
-- Ensure the cluster is reachable
+- Verify Istio sidecar injection is enabled for the namespace
+- Check pod annotations: `kubectl get pod <pod-name> -n <namespace> -o yaml`
 
-### "No pods found matching deployments"
+### [INIT] logs not appearing
 
-- Verify deployment names are correct
-- The tool matches pods by:
-  - `app` label matching deployment name
-  - Pod name containing deployment name
-  - Owner references (ReplicaSet) starting with deployment name
-
-## License
-
-MIT License
+- Init containers may have already completed; check pod status
+- Use `previous: true` if init containers failed and pod restarted
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please submit pull requests or open issues for bugs and feature requests.
+
+## License
+
+MIT License - see LICENSE file for details
+
+---
+
+**Last Updated**: 2025-12-30  
+**Version**: 2.0.0  
+**Maintainer**: @challamani
