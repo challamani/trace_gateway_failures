@@ -7,101 +7,167 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"strings"
 
-	"github.com/challamani/trace_gateway_failures/pkg/config"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 )
 
 const (
-	toolName        = "get_pod_logs"
-	toolDescription = "Retrieve logs from pods in specified namespaces and deployments with support for init containers"
+	MCPVersion = "2024-11-05"
 )
 
-type MCPServer struct {
-	config    *config.Config
-	k8sClient *kubernetes.Clientset
+// Server represents the MCP server
+type Server struct {
+	clientset *kubernetes.Clientset
 }
 
+// NewServer creates a new MCP server instance
+func NewServer() *Server {
+	return &Server{}
+}
+
+// InitializeKubeClient initializes the Kubernetes client using local kubeconfig
+func (s *Server) InitializeKubeClient() error {
+	// Use the default kubeconfig path
+	kubeconfig := clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
+	if home := homedir.HomeDir(); home != "" && kubeconfig == "" {
+		kubeconfig = home + "/.kube/config"
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to build config: %w", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	s.clientset = clientset
+	log.Println("Kubernetes client initialized successfully")
+	return nil
+}
+
+// StdioTransport handles stdio-based communication
+type StdioTransport struct {
+	Reader io.Reader
+	Writer io.Writer
+}
+
+// MCPRequest represents an incoming MCP request
+type MCPRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// MCPResponse represents an MCP response
+type MCPResponse struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      interface{} `json:"id,omitempty"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *MCPError   `json:"error,omitempty"`
+}
+
+// MCPError represents an error in MCP protocol
+type MCPError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+// NamespaceConfig represents configuration for a single namespace
 type NamespaceConfig struct {
 	Name        string   `json:"name"`
 	Deployments []string `json:"deployments"`
 	TailLines   int64    `json:"tail_lines,omitempty"`
 }
 
-func NewMCPServer(cfg *config.Config) (*MCPServer, error) {
-	k8sClient, err := createK8sClient(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create k8s client: %w", err)
-	}
+// Start starts the MCP server with the given transport
+func (s *Server) Start(transport *StdioTransport) error {
+	scanner := bufio.NewScanner(transport.Reader)
+	encoder := json.NewEncoder(transport.Writer)
 
-	return &MCPServer{
-		config:    cfg,
-		k8sClient: k8sClient,
-	}, nil
-}
-
-func createK8sClient(cfg *config.Config) (*kubernetes.Clientset, error) {
-	var k8sConfig *rest.Config
-	var err error
-
-	if cfg.Kubernetes.InCluster {
-		k8sConfig, err = rest.InClusterConfig()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create in-cluster config: %w", err)
-		}
-	} else {
-		kubeconfigPath := cfg.Kubernetes.KubeconfigPath
-		if kubeconfigPath == "" {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				return nil, fmt.Errorf("failed to get home directory: %w", err)
-			}
-			kubeconfigPath = homeDir + "/.kube/config"
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
 		}
 
-		k8sConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build config from kubeconfig: %w", err)
+		var req MCPRequest
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			log.Printf("Failed to parse request: %v", err)
+			s.sendError(encoder, nil, -32700, "Parse error", nil)
+			continue
+		}
+
+		response := s.handleRequest(&req)
+		if err := encoder.Encode(response); err != nil {
+			log.Printf("Failed to send response: %v", err)
 		}
 	}
 
-	clientset, err := kubernetes.NewForConfig(k8sConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create kubernetes clientset: %w", err)
-	}
-
-	return clientset, nil
-}
-
-func (s *MCPServer) Start() error {
-	mcpServer := server.NewMCPServer(
-		"Kubernetes Pod Logs MCP Server",
-		"1.0.0",
-		server.WithToolHandler(s.handleToolsList, s.handleToolCall),
-	)
-
-	if err := server.ServeStdio(mcpServer); err != nil {
-		return fmt.Errorf("failed to start MCP server: %w", err)
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scanner error: %w", err)
 	}
 
 	return nil
 }
 
-func (s *MCPServer) handleToolsList() ([]mcp.Tool, error) {
-	tools := []mcp.Tool{
+// handleRequest processes an MCP request and returns a response
+func (s *Server) handleRequest(req *MCPRequest) *MCPResponse {
+	switch req.Method {
+	case "initialize":
+		return s.handleInitialize(req)
+	case "tools/list":
+		return s.handleToolsList(req)
+	case "tools/call":
+		return s.handleToolsCall(req)
+	default:
+		return &MCPResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &MCPError{
+				Code:    -32601,
+				Message: "Method not found",
+			},
+		}
+	}
+}
+
+// handleInitialize handles the initialize request
+func (s *Server) handleInitialize(req *MCPRequest) *MCPResponse {
+	return &MCPResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result: map[string]interface{}{
+			"protocolVersion": MCPVersion,
+			"capabilities": map[string]interface{}{
+				"tools": map[string]interface{}{},
+			},
+			"serverInfo": map[string]interface{}{
+				"name":    "trace_gateway_failures",
+				"version": "1.0.0",
+			},
+		},
+	}
+}
+
+// handleToolsList handles the tools/list request
+func (s *Server) handleToolsList(req *MCPRequest) *MCPResponse {
+	tools := []map[string]interface{}{
 		{
-			Name:        toolName,
-			Description: toolDescription,
-			InputSchema: mcp.ToolInputSchema{
-				Type: "object",
-				Properties: map[string]interface{}{
+			"name":        "get_pod_logs",
+			"description": "Retrieve pod logs for given namespaces and deployment names to trace gateway failures. Supports init containers with [INIT] prefix.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
 					"namespaces": map[string]interface{}{
 						"type":        "array",
 						"description": "Array of namespace configurations with deployments and optional tail_lines",
@@ -114,292 +180,298 @@ func (s *MCPServer) handleToolsList() ([]mcp.Tool, error) {
 								},
 								"deployments": map[string]interface{}{
 									"type":        "array",
-									"description": "List of deployment names to filter pods",
+									"description": "List of deployment names to filter pods in this namespace",
 									"items": map[string]interface{}{
 										"type": "string",
 									},
 								},
 								"tail_lines": map[string]interface{}{
 									"type":        "integer",
-									"description": "Number of lines to retrieve from the end of logs for this namespace (default: 100)",
+									"description": "Number of lines from the end of logs for this namespace (default: 100)",
 									"default":     100,
 								},
 							},
 							"required": []string{"name", "deployments"},
 						},
 					},
-					"include_timestamps": map[string]interface{}{
-						"type":        "boolean",
-						"description": "Include timestamps in log output",
-						"default":     false,
-					},
-					"since_seconds": map[string]interface{}{
-						"type":        "integer",
-						"description": "Only return logs newer than a relative duration in seconds",
-					},
 					"previous": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Return previous terminated container logs",
+						"description": "Retrieve logs from previous terminated container (default: false)",
 						"default":     false,
 					},
 				},
-				Required: []string{"namespaces"},
+				"required": []string{"namespaces"},
 			},
 		},
 	}
 
-	return tools, nil
+	return &MCPResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result: map[string]interface{}{
+			"tools": tools,
+		},
+	}
 }
 
-func (s *MCPServer) handleToolCall(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if request.Params.Name != toolName {
-		return nil, fmt.Errorf("unknown tool: %s", request.Params.Name)
-	}
-
-	return s.handleGetPodLogs(ctx, request.Params.Arguments)
+// ToolCallParams represents parameters for a tool call
+type ToolCallParams struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
 }
 
-func (s *MCPServer) handleGetPodLogs(ctx context.Context, arguments map[string]interface{}) (*mcp.CallToolResult, error) {
-	// Parse namespaces configuration
-	namespacesRaw, ok := arguments["namespaces"]
-	if !ok {
-		return nil, fmt.Errorf("namespaces parameter is required")
+// handleToolsCall handles the tools/call request
+func (s *Server) handleToolsCall(req *MCPRequest) *MCPResponse {
+	var params ToolCallParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return &MCPResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &MCPError{
+				Code:    -32602,
+				Message: "Invalid params",
+				Data:    err.Error(),
+			},
+		}
 	}
 
-	namespacesArray, ok := namespacesRaw.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("namespaces must be an array")
+	switch params.Name {
+	case "get_pod_logs":
+		return s.handleGetPodLogs(req, params.Arguments)
+	default:
+		return &MCPResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &MCPError{
+				Code:    -32601,
+				Message: "Tool not found",
+			},
+		}
 	}
+}
 
+// handleGetPodLogs retrieves pod logs based on namespace configurations
+func (s *Server) handleGetPodLogs(req *MCPRequest, args map[string]interface{}) *MCPResponse {
+	// Parse namespaces array
 	var namespaceConfigs []NamespaceConfig
-	for _, nsRaw := range namespacesArray {
-		nsMap, ok := nsRaw.(map[string]interface{})
-		if !ok {
-			return nil, fmt.Errorf("each namespace must be an object")
-		}
+	if nsArray, ok := args["namespaces"].([]interface{}); ok {
+		for _, nsItem := range nsArray {
+			if nsMap, ok := nsItem.(map[string]interface{}); ok {
+				config := NamespaceConfig{
+					TailLines: 100, // default
+				}
 
-		name, ok := nsMap["name"].(string)
-		if !ok || name == "" {
-			return nil, fmt.Errorf("namespace name is required and must be a string")
-		}
+				if name, ok := nsMap["name"].(string); ok {
+					config.Name = name
+				}
 
-		deploymentsRaw, ok := nsMap["deployments"]
-		if !ok {
-			return nil, fmt.Errorf("deployments are required for namespace %s", name)
-		}
+				if depsArray, ok := nsMap["deployments"].([]interface{}); ok {
+					for _, dep := range depsArray {
+						if depStr, ok := dep.(string); ok {
+							config.Deployments = append(config.Deployments, depStr)
+						}
+					}
+				}
 
-		deploymentsArray, ok := deploymentsRaw.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("deployments must be an array for namespace %s", name)
-		}
+				if tailLines, ok := nsMap["tail_lines"].(float64); ok {
+					config.TailLines = int64(tailLines)
+				}
 
-		var deployments []string
-		for _, d := range deploymentsArray {
-			if depStr, ok := d.(string); ok {
-				deployments = append(deployments, depStr)
+				if config.Name != "" && len(config.Deployments) > 0 {
+					namespaceConfigs = append(namespaceConfigs, config)
+				}
 			}
 		}
-
-		if len(deployments) == 0 {
-			return nil, fmt.Errorf("at least one deployment is required for namespace %s", name)
-		}
-
-		tailLines := int64(100) // default
-		if tl, ok := nsMap["tail_lines"]; ok {
-			if tlFloat, ok := tl.(float64); ok {
-				tailLines = int64(tlFloat)
-			}
-		}
-
-		namespaceConfigs = append(namespaceConfigs, NamespaceConfig{
-			Name:        name,
-			Deployments: deployments,
-			TailLines:   tailLines,
-		})
-	}
-
-	// Parse optional parameters
-	includeTimestamps := false
-	if ts, ok := arguments["include_timestamps"].(bool); ok {
-		includeTimestamps = ts
-	}
-
-	var sinceSeconds *int64
-	if ss, ok := arguments["since_seconds"].(float64); ok {
-		seconds := int64(ss)
-		sinceSeconds = &seconds
 	}
 
 	previous := false
-	if prev, ok := arguments["previous"].(bool); ok {
+	if prev, ok := args["previous"].(bool); ok {
 		previous = prev
 	}
 
-	// Get pod logs
-	logs, err := s.getPodLogs(ctx, namespaceConfigs, includeTimestamps, sinceSeconds, previous)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pod logs: %w", err)
+	if len(namespaceConfigs) == 0 {
+		return &MCPResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &MCPError{
+				Code:    -32602,
+				Message: "At least one valid namespace configuration is required",
+			},
+		}
 	}
 
-	return &mcp.CallToolResult{
-		Content: []interface{}{
-			mcp.TextContent{
-				Type: "text",
-				Text: logs,
+	// Retrieve logs
+	logsResult, err := s.getPodLogs(namespaceConfigs, previous)
+	if err != nil {
+		return &MCPResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &MCPError{
+				Code:    -32000,
+				Message: "Failed to retrieve pod logs",
+				Data:    err.Error(),
+			},
+		}
+	}
+
+	return &MCPResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result: map[string]interface{}{
+			"content": []map[string]interface{}{
+				{
+					"type": "text",
+					"text": logsResult,
+				},
 			},
 		},
-	}, nil
+	}
 }
 
-func (s *MCPServer) getPodLogs(ctx context.Context, namespaceConfigs []NamespaceConfig, includeTimestamps bool, sinceSeconds *int64, previous bool) (string, error) {
-	var allLogs strings.Builder
+// getPodLogs retrieves logs from pods matching the criteria
+func (s *Server) getPodLogs(namespaceConfigs []NamespaceConfig, previous bool) (string, error) {
+	if s.clientset == nil {
+		return "", fmt.Errorf("Kubernetes client not initialized - ensure valid kubeconfig is available")
+	}
+
+	ctx := context.Background()
+	var result strings.Builder
+
+	result.WriteString("=== Pod Logs Analysis for Gateway Failure Tracing ===\n\n")
 
 	for _, nsConfig := range namespaceConfigs {
 		namespace := nsConfig.Name
 		deployments := nsConfig.Deployments
 		tailLines := nsConfig.TailLines
 
-		allLogs.WriteString(fmt.Sprintf("\n=== Namespace: %s ===\n", namespace))
+		result.WriteString(fmt.Sprintf("Namespace: %s\n", namespace))
+		result.WriteString(strings.Repeat("=", 80) + "\n\n")
 
-		pods, err := s.k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		// List all pods in the namespace
+		pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			log.Printf("Error listing pods in namespace %s: %v", namespace, err)
-			allLogs.WriteString(fmt.Sprintf("Error listing pods: %v\n", err))
+			result.WriteString(fmt.Sprintf("Error listing pods in namespace %s: %v\n\n", namespace, err))
 			continue
 		}
 
-		filteredPods := filterPodsByDeployment(pods.Items, deployments)
+		if len(pods.Items) == 0 {
+			result.WriteString(fmt.Sprintf("No pods found in namespace %s\n\n", namespace))
+			continue
+		}
+
+		// Filter pods by deployment if specified
+		filteredPods := s.filterPodsByDeployment(pods.Items, deployments)
+
 		if len(filteredPods) == 0 {
-			allLogs.WriteString(fmt.Sprintf("No pods found for deployments: %s\n", strings.Join(deployments, ", ")))
+			result.WriteString(fmt.Sprintf("No pods found matching deployments %v in namespace %s\n\n", deployments, namespace))
 			continue
 		}
 
+		// Get logs from each pod
 		for _, pod := range filteredPods {
-			ownerInfo := getOwnerInfo(&pod)
-			allLogs.WriteString(fmt.Sprintf("\n--- Pod: %s (Owner: %s) ---\n", pod.Name, ownerInfo))
+			result.WriteString(fmt.Sprintf("Pod: %s (Status: %s)\n", pod.Name, pod.Status.Phase))
 
-			// Get logs from init containers first
+			// Get deployment/replicaset info from owner references
+			ownerInfo := s.getOwnerInfo(&pod)
+			if ownerInfo != "" {
+				result.WriteString(fmt.Sprintf("Owner: %s\n", ownerInfo))
+			}
+
+			result.WriteString(strings.Repeat("-", 80) + "\n")
+
+			// Collect all containers (init + regular)
+			type containerInfo struct {
+				name   string
+				isInit bool
+			}
+			allContainers := make([]containerInfo, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+
+			// Add init containers first
 			for _, container := range pod.Spec.InitContainers {
-				containerName := fmt.Sprintf("[INIT] %s", container.Name)
-				allLogs.WriteString(fmt.Sprintf("\nContainer: %s\n", containerName))
-
-				logOptions := &metav1.PodLogOptions{
-					Container:  container.Name,
-					Timestamps: includeTimestamps,
-					TailLines:  &tailLines,
-					Previous:   previous,
-				}
-
-				if sinceSeconds != nil {
-					logOptions.SinceSeconds = sinceSeconds
-				}
-
-				req := s.k8sClient.CoreV1().Pods(namespace).GetLogs(pod.Name, logOptions)
-				podLogs, err := req.Stream(ctx)
-				if err != nil {
-					log.Printf("Error getting logs for init container %s in pod %s: %v", container.Name, pod.Name, err)
-					allLogs.WriteString(fmt.Sprintf("Error getting logs: %v\n", err))
-					continue
-				}
-
-				scanner := bufio.NewScanner(podLogs)
-				for scanner.Scan() {
-					allLogs.WriteString(scanner.Text() + "\n")
-				}
-				podLogs.Close()
-
-				if err := scanner.Err(); err != nil && err != io.EOF {
-					log.Printf("Error reading logs for init container %s: %v", container.Name, err)
-					allLogs.WriteString(fmt.Sprintf("Error reading logs: %v\n", err))
-				}
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: true,
+				})
 			}
 
-			// Get logs from regular containers
+			// Add regular containers
 			for _, container := range pod.Spec.Containers {
-				allLogs.WriteString(fmt.Sprintf("\nContainer: %s\n", container.Name))
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: false,
+				})
+			}
 
-				logOptions := &metav1.PodLogOptions{
-					Container:  container.Name,
-					Timestamps: includeTimestamps,
-					TailLines:  &tailLines,
-					Previous:   previous,
+			// Get logs from each container
+			for _, container := range allContainers {
+				// Label init containers with [INIT] prefix
+				if container.isInit {
+					result.WriteString(fmt.Sprintf("\nContainer: [INIT] %s\n", container.name))
+				} else {
+					result.WriteString(fmt.Sprintf("\nContainer: %s\n", container.name))
 				}
 
-				if sinceSeconds != nil {
-					logOptions.SinceSeconds = sinceSeconds
+				logOptions := &corev1.PodLogOptions{
+					Container: container.name,
+					TailLines: &tailLines,
+					Previous:  previous,
 				}
 
-				req := s.k8sClient.CoreV1().Pods(namespace).GetLogs(pod.Name, logOptions)
-				podLogs, err := req.Stream(ctx)
+				logs, err := s.clientset.CoreV1().Pods(namespace).GetLogs(pod.Name, logOptions).Stream(ctx)
 				if err != nil {
-					log.Printf("Error getting logs for container %s in pod %s: %v", container.Name, pod.Name, err)
-					allLogs.WriteString(fmt.Sprintf("Error getting logs: %v\n", err))
+					result.WriteString(fmt.Sprintf("Error retrieving logs: %v\n", err))
 					continue
 				}
 
-				scanner := bufio.NewScanner(podLogs)
-				for scanner.Scan() {
-					allLogs.WriteString(scanner.Text() + "\n")
+				logBytes, err := io.ReadAll(logs)
+				if closeErr := logs.Close(); closeErr != nil {
+					log.Printf("Error closing log stream: %v", closeErr)
 				}
-				podLogs.Close()
+				if err != nil {
+					result.WriteString(fmt.Sprintf("Error reading logs: %v\n", err))
+					continue
+				}
 
-				if err := scanner.Err(); err != nil && err != io.EOF {
-					log.Printf("Error reading logs for container %s: %v", container.Name, err)
-					allLogs.WriteString(fmt.Sprintf("Error reading logs: %v\n", err))
+				if len(logBytes) == 0 {
+					result.WriteString("(No logs available)\n")
+				} else {
+					result.WriteString(string(logBytes))
+					result.WriteString("\n")
 				}
 			}
+
+			result.WriteString("\n" + strings.Repeat("=", 80) + "\n\n")
 		}
 	}
 
-	return allLogs.String(), nil
+	return result.String(), nil
 }
 
-func filterPodsByDeployment(pods []interface{}, deployments []string) []interface{} {
+// filterPodsByDeployment filters pods by deployment names
+func (s *Server) filterPodsByDeployment(pods []corev1.Pod, deployments []string) []corev1.Pod {
 	if len(deployments) == 0 {
 		return pods
 	}
 
-	deploymentSet := make(map[string]bool)
-	for _, d := range deployments {
-		deploymentSet[d] = true
-	}
-
-	var filtered []interface{}
+	var filtered []corev1.Pod
 	for _, pod := range pods {
-		podObj, ok := pod.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		metadata, ok := podObj["metadata"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		ownerReferences, ok := metadata["ownerReferences"].([]interface{})
-		if !ok {
-			continue
-		}
-
-		for _, owner := range ownerReferences {
-			ownerObj, ok := owner.(map[string]interface{})
-			if !ok {
-				continue
+		// Check labels for deployment match
+		for _, deployment := range deployments {
+			// Check if pod has app label matching deployment
+			if appLabel, ok := pod.Labels["app"]; ok && appLabel == deployment {
+				filtered = append(filtered, pod)
+				break
 			}
-
-			kind, _ := ownerObj["kind"].(string)
-			name, _ := ownerObj["name"].(string)
-
-			if kind == "ReplicaSet" {
-				// Extract deployment name from ReplicaSet name
-				// ReplicaSet names are typically in format: deployment-name-xxxxx
-				parts := strings.Split(name, "-")
-				if len(parts) >= 2 {
-					deploymentName := strings.Join(parts[:len(parts)-1], "-")
-					if deploymentSet[deploymentName] {
-						filtered = append(filtered, pod)
-						break
-					}
+			// Check if pod name contains deployment name
+			if strings.Contains(pod.Name, deployment) {
+				filtered = append(filtered, pod)
+				break
+			}
+			// Check owner references
+			for _, owner := range pod.OwnerReferences {
+				if owner.Kind == "ReplicaSet" && strings.HasPrefix(owner.Name, deployment) {
+					filtered = append(filtered, pod)
+					break
 				}
 			}
 		}
@@ -408,45 +480,32 @@ func filterPodsByDeployment(pods []interface{}, deployments []string) []interfac
 	return filtered
 }
 
-func getOwnerInfo(pod interface{}) string {
-	podObj, ok := pod.(map[string]interface{})
-	if !ok {
-		return "Unknown"
-	}
-
-	metadata, ok := podObj["metadata"].(map[string]interface{})
-	if !ok {
-		return "Unknown"
-	}
-
-	ownerReferences, ok := metadata["ownerReferences"].([]interface{})
-	if !ok || len(ownerReferences) == 0 {
-		return "None"
+// getOwnerInfo extracts owner information from pod
+func (s *Server) getOwnerInfo(pod *corev1.Pod) string {
+	if len(pod.OwnerReferences) == 0 {
+		return ""
 	}
 
 	var owners []string
-	for _, owner := range ownerReferences {
-		ownerObj, ok := owner.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		kind, _ := ownerObj["kind"].(string)
-		name, _ := ownerObj["name"].(string)
-		owners = append(owners, fmt.Sprintf("%s/%s", kind, name))
+	for _, owner := range pod.OwnerReferences {
+		owners = append(owners, fmt.Sprintf("%s/%s", owner.Kind, owner.Name))
 	}
 
 	return strings.Join(owners, ", ")
 }
 
-func sendError(w io.Writer, id interface{}, errMsg string) {
-	response := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"error": map[string]interface{}{
-			"code":    -32603,
-			"message": errMsg,
+// sendError sends an error response
+func (s *Server) sendError(encoder *json.Encoder, id interface{}, code int, message string, data interface{}) {
+	response := &MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &MCPError{
+			Code:    code,
+			Message: message,
+			Data:    data,
 		},
 	}
-	json.NewEncoder(w).Encode(response)
+	if err := encoder.Encode(response); err != nil {
+		log.Printf("Failed to send error response: %v", err)
+	}
 }
