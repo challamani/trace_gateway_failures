@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Test script for MCP server
 # This script sends various MCP requests to test the server functionality
