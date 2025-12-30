@@ -6,120 +6,239 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"strings"
+	"time"
 
-	"github.com/challamani/trace_gateway_failures/pkg/k8s"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
-// ToolNames
-const (
-	GetPodLogsToolName = "get_pod_logs"
-)
-
-// Server wraps the MCP server with Kubernetes client
+// Server represents the MCP server
 type Server struct {
-	mcpServer *server.MCPServer
-	k8sClient *k8s.Client
+	clientset *kubernetes.Clientset
 }
 
-// LogTarget represents a target for fetching logs with its own configuration
-type LogTarget struct {
+// NewServer creates a new MCP server instance
+func NewServer() (*Server, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		// Fallback to kubeconfig
+		kubeconfig := clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create kubernetes config: %w", err)
+		}
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes clientset: %w", err)
+	}
+
+	return &Server{
+		clientset: clientset,
+	}, nil
+}
+
+// Target represents a single log collection target
+type Target struct {
 	Namespace   string   `json:"namespace"`
 	Deployments []string `json:"deployments"`
-	TailLines   int64    `json:"tail_lines"`
+	TailLines   int64    `json:"tail_lines,omitempty"`
 }
 
-// NewServer creates a new MCP server with Kubernetes integration
-func NewServer() (*Server, error) {
-	k8sClient, err := k8s.NewClient()
+// LogsRequest represents the request parameters for fetching logs
+type LogsRequest struct {
+	Targets  []Target `json:"targets"`
+	Previous bool     `json:"previous,omitempty"`
+}
+
+// GetPodLogs fetches logs from pods based on the targets array
+func (s *Server) GetPodLogs(ctx context.Context, req LogsRequest) (string, error) {
+	var allLogs strings.Builder
+
+	for _, target := range req.Targets {
+		namespace := target.Namespace
+		if namespace == "" {
+			namespace = "default"
+		}
+
+		tailLines := target.TailLines
+		if tailLines == 0 {
+			tailLines = 100 // Default tail lines
+		}
+
+		for _, deploymentName := range target.Deployments {
+			// Get deployment to find pods
+			deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			if err != nil {
+				allLogs.WriteString(fmt.Sprintf("Error getting deployment %s in namespace %s: %v\n\n", deploymentName, namespace, err))
+				continue
+			}
+
+			// Get pods for this deployment
+			labelSelector := metav1.FormatLabelSelector(deployment.Spec.Selector)
+			pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labelSelector,
+			})
+			if err != nil {
+				allLogs.WriteString(fmt.Sprintf("Error listing pods for deployment %s: %v\n\n", deploymentName, err))
+				continue
+			}
+
+			if len(pods.Items) == 0 {
+				allLogs.WriteString(fmt.Sprintf("No pods found for deployment %s in namespace %s\n\n", deploymentName, namespace))
+				continue
+			}
+
+			// Fetch logs from each pod
+			for _, pod := range pods.Items {
+				allLogs.WriteString(fmt.Sprintf("=== Logs from Pod: %s (Namespace: %s, Deployment: %s) ===\n", pod.Name, namespace, deploymentName))
+
+				// Get logs from init containers
+				for _, initContainer := range pod.Spec.InitContainers {
+					containerLogs, err := s.fetchContainerLogs(ctx, namespace, pod.Name, initContainer.Name, tailLines, req.Previous, true)
+					if err != nil {
+						allLogs.WriteString(fmt.Sprintf("[INIT] Container %s - Error: %v\n", initContainer.Name, err))
+					} else {
+						allLogs.WriteString(fmt.Sprintf("[INIT] Container: %s\n%s\n", initContainer.Name, containerLogs))
+					}
+				}
+
+				// Get logs from regular containers
+				for _, container := range pod.Spec.Containers {
+					containerLogs, err := s.fetchContainerLogs(ctx, namespace, pod.Name, container.Name, tailLines, req.Previous, false)
+					if err != nil {
+						allLogs.WriteString(fmt.Sprintf("Container %s - Error: %v\n", container.Name, err))
+					} else {
+						allLogs.WriteString(fmt.Sprintf("Container: %s\n%s\n", container.Name, containerLogs))
+					}
+				}
+
+				allLogs.WriteString("\n")
+			}
+		}
+	}
+
+	if allLogs.Len() == 0 {
+		return "No logs found for the specified targets", nil
+	}
+
+	return allLogs.String(), nil
+}
+
+// fetchContainerLogs retrieves logs from a specific container in a pod
+func (s *Server) fetchContainerLogs(ctx context.Context, namespace, podName, containerName string, tailLines int64, previous, isInit bool) (string, error) {
+	podLogOpts := &metav1.PodLogOptions{
+		Container: containerName,
+		TailLines: &tailLines,
+		Previous:  previous,
+	}
+
+	req := s.clientset.CoreV1().Pods(namespace).GetLogs(podName, podLogOpts)
+	podLogs, err := req.Stream(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
+		return "", fmt.Errorf("failed to get log stream: %w", err)
+	}
+	defer podLogs.Close()
+
+	var logs strings.Builder
+	scanner := bufio.NewScanner(podLogs)
+	for scanner.Scan() {
+		logs.WriteString(scanner.Text())
+		logs.WriteString("\n")
 	}
 
-	mcpServer := server.NewMCPServer(
-		"Kubernetes Pod Logs Server",
-		"1.0.0",
-		server.WithToolCapabilities(true),
-	)
-
-	s := &Server{
-		mcpServer: mcpServer,
-		k8sClient: k8sClient,
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		return "", fmt.Errorf("error reading logs: %w", err)
 	}
 
-	// Register tool handlers
-	mcpServer.AddTool(mcp.Tool{
-		Name:        GetPodLogsToolName,
-		Description: "Get logs from pods in specified Kubernetes deployments across multiple namespaces. Supports fetching logs from multiple targets with individual configurations.",
-		InputSchema: mcp.ToolInputSchema{
-			Type: "object",
-			Properties: map[string]interface{}{
-				"targets": map[string]interface{}{
-					"type":        "array",
-					"description": "Array of log targets, each with namespace, deployments, and tail_lines",
-					"items": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"namespace": map[string]interface{}{
-								"type":        "string",
-								"description": "Kubernetes namespace to fetch logs from",
-							},
-							"deployments": map[string]interface{}{
-								"type":        "array",
-								"description": "Array of deployment names to fetch logs from",
-								"items": map[string]interface{}{
-									"type": "string",
-								},
-							},
-							"tail_lines": map[string]interface{}{
-								"type":        "number",
-								"description": "Number of lines to fetch from the end of logs (default: 100)",
-							},
-						},
-						"required": []string{"namespace", "deployments"},
-					},
-				},
-				"previous": map[string]interface{}{
-					"type":        "boolean",
-					"description": "Whether to fetch logs from previous container instance (default: false)",
-				},
+	return logs.String(), nil
+}
+
+// HandleToolCall processes MCP tool calls
+func (s *Server) HandleToolCall(toolName string, arguments map[string]interface{}) (interface{}, error) {
+	switch toolName {
+	case "get_pod_logs":
+		return s.handleGetPodLogs(arguments)
+	default:
+		return nil, fmt.Errorf("unknown tool: %s", toolName)
+	}
+}
+
+// handleGetPodLogs processes the get_pod_logs tool call
+func (s *Server) handleGetPodLogs(arguments map[string]interface{}) (interface{}, error) {
+	// Parse arguments
+	var req LogsRequest
+
+	// Extract targets
+	targetsData, ok := arguments["targets"]
+	if !ok || targetsData == nil {
+		return nil, fmt.Errorf("targets parameter is required")
+	}
+
+	// Convert to JSON and back to parse properly
+	targetsJSON, err := json.Marshal(targetsData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal targets: %w", err)
+	}
+
+	if err := json.Unmarshal(targetsJSON, &req.Targets); err != nil {
+		return nil, fmt.Errorf("failed to parse targets: %w", err)
+	}
+
+	// Extract previous flag
+	if previousVal, ok := arguments["previous"]; ok {
+		if previousBool, ok := previousVal.(bool); ok {
+			req.Previous = previousBool
+		}
+	}
+
+	// Validate that we have at least one target
+	if len(req.Targets) == 0 {
+		return nil, fmt.Errorf("at least one target is required")
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Fetch logs
+	logs, err := s.GetPodLogs(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod logs: %w", err)
+	}
+
+	return map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": logs,
 			},
-			Required: []string{"targets"},
 		},
-	}, s.handleGetPodLogs)
-
-	return s, nil
+	}, nil
 }
 
-// Start begins serving the MCP server
-func (s *Server) Start() error {
-	log.Println("Starting Kubernetes Pod Logs MCP Server...")
-	return s.mcpServer.Serve()
-}
-
-// handleToolsList handles the tools/list request
-func (s *Server) handleToolsList(request mcp.ToolsListRequest) (*mcp.ToolsListResult, error) {
-	tools := []mcp.Tool{
+// GetToolDefinitions returns the MCP tool definitions
+func (s *Server) GetToolDefinitions() []map[string]interface{} {
+	return []map[string]interface{}{
 		{
-			Name:        GetPodLogsToolName,
-			Description: "Get logs from pods in specified Kubernetes deployments across multiple namespaces. Supports fetching logs from multiple targets with individual configurations.",
-			InputSchema: mcp.ToolInputSchema{
-				Type: "object",
-				Properties: map[string]interface{}{
+			"name":        "get_pod_logs",
+			"description": "Fetch logs from Kubernetes pods based on deployment names across multiple namespaces with init container support",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
 					"targets": map[string]interface{}{
 						"type":        "array",
-						"description": "Array of log targets, each with namespace, deployments, and tail_lines",
+						"description": "Array of log collection targets, each specifying namespace, deployments, and tail lines",
 						"items": map[string]interface{}{
 							"type": "object",
 							"properties": map[string]interface{}{
 								"namespace": map[string]interface{}{
 									"type":        "string",
-									"description": "Kubernetes namespace to fetch logs from",
+									"description": "Kubernetes namespace (defaults to 'default' if not specified)",
 								},
 								"deployments": map[string]interface{}{
 									"type":        "array",
@@ -129,8 +248,8 @@ func (s *Server) handleToolsList(request mcp.ToolsListRequest) (*mcp.ToolsListRe
 									},
 								},
 								"tail_lines": map[string]interface{}{
-									"type":        "number",
-									"description": "Number of lines to fetch from the end of logs (default: 100)",
+									"type":        "integer",
+									"description": "Number of lines to tail from the end of logs (defaults to 100 if not specified)",
 								},
 							},
 							"required": []string{"namespace", "deployments"},
@@ -138,193 +257,11 @@ func (s *Server) handleToolsList(request mcp.ToolsListRequest) (*mcp.ToolsListRe
 					},
 					"previous": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Whether to fetch logs from previous container instance (default: false)",
+						"description": "If true, fetch logs from previous terminated container instances (globalCurrent Date: 2025-12-30 13:23:05)",
 					},
 				},
-				Required: []string{"targets"},
+				"required": []string{"targets"},
 			},
 		},
 	}
-
-	return &mcp.ToolsListResult{
-		Tools: tools,
-	}, nil
-}
-
-// handleGetPodLogs handles the get_pod_logs tool call
-func (s *Server) handleGetPodLogs(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
-	// Parse targets array
-	targetsRaw, ok := arguments["targets"]
-	if !ok {
-		return mcp.NewToolResultError("targets parameter is required"), nil
-	}
-
-	targetsArray, ok := targetsRaw.([]interface{})
-	if !ok {
-		return mcp.NewToolResultError("targets must be an array"), nil
-	}
-
-	var targets []LogTarget
-	for i, targetRaw := range targetsArray {
-		targetMap, ok := targetRaw.(map[string]interface{})
-		if !ok {
-			return mcp.NewToolResultError(fmt.Sprintf("target at index %d must be an object", i)), nil
-		}
-
-		// Parse namespace
-		namespace, ok := targetMap["namespace"].(string)
-		if !ok || namespace == "" {
-			return mcp.NewToolResultError(fmt.Sprintf("target at index %d: namespace is required and must be a string", i)), nil
-		}
-
-		// Parse deployments
-		deploymentsRaw, ok := targetMap["deployments"]
-		if !ok {
-			return mcp.NewToolResultError(fmt.Sprintf("target at index %d: deployments is required", i)), nil
-		}
-
-		deploymentsArray, ok := deploymentsRaw.([]interface{})
-		if !ok {
-			return mcp.NewToolResultError(fmt.Sprintf("target at index %d: deployments must be an array", i)), nil
-		}
-
-		var deployments []string
-		for _, d := range deploymentsArray {
-			if depStr, ok := d.(string); ok {
-				deployments = append(deployments, depStr)
-			}
-		}
-
-		if len(deployments) == 0 {
-			return mcp.NewToolResultError(fmt.Sprintf("target at index %d: at least one deployment is required", i)), nil
-		}
-
-		// Parse tail_lines (optional, default 100)
-		tailLines := int64(100)
-		if tailLinesRaw, ok := targetMap["tail_lines"]; ok {
-			if tailLinesFloat, ok := tailLinesRaw.(float64); ok {
-				tailLines = int64(tailLinesFloat)
-			}
-		}
-
-		targets = append(targets, LogTarget{
-			Namespace:   namespace,
-			Deployments: deployments,
-			TailLines:   tailLines,
-		})
-	}
-
-	// Parse previous parameter
-	previous := false
-	if prevRaw, ok := arguments["previous"]; ok {
-		if prevBool, ok := prevRaw.(bool); ok {
-			previous = prevBool
-		}
-	}
-
-	// Get pod logs using the new structure
-	logs, err := s.getPodLogs(context.Background(), targets, previous)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to get pod logs: %v", err)), nil
-	}
-
-	return mcp.NewToolResultText(logs), nil
-}
-
-// getPodLogs fetches logs from pods in the specified targets
-func (s *Server) getPodLogs(ctx context.Context, targets []LogTarget, previous bool) (string, error) {
-	var allLogs strings.Builder
-
-	for _, target := range targets {
-		allLogs.WriteString(fmt.Sprintf("\n=== Namespace: %s ===\n", target.Namespace))
-
-		for _, deployment := range target.Deployments {
-			// Get pods for this deployment
-			pods, err := s.k8sClient.Clientset.CoreV1().Pods(target.Namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: fmt.Sprintf("app=%s", deployment),
-			})
-			if err != nil {
-				allLogs.WriteString(fmt.Sprintf("Error listing pods for deployment %s: %v\n", deployment, err))
-				continue
-			}
-
-			if len(pods.Items) == 0 {
-				allLogs.WriteString(fmt.Sprintf("No pods found for deployment: %s\n", deployment))
-				continue
-			}
-
-			// Process each pod
-			for _, pod := range pods.Items {
-				allLogs.WriteString(fmt.Sprintf("\n--- Pod: %s (Deployment: %s) ---\n", pod.Name, deployment))
-
-				// Get logs from all containers in the pod
-				for _, container := range pod.Spec.Containers {
-					containerLogs, err := s.getContainerLogs(ctx, target.Namespace, pod.Name, container.Name, target.TailLines, previous)
-					if err != nil {
-						allLogs.WriteString(fmt.Sprintf("Error getting logs for container %s: %v\n", container.Name, err))
-						continue
-					}
-					allLogs.WriteString(fmt.Sprintf("\nContainer: %s\n", container.Name))
-					allLogs.WriteString(containerLogs)
-					allLogs.WriteString("\n")
-				}
-
-				// Get logs from init containers if they exist
-				for _, initContainer := range pod.Spec.InitContainers {
-					initContainerLogs, err := s.getContainerLogs(ctx, target.Namespace, pod.Name, initContainer.Name, target.TailLines, previous)
-					if err != nil {
-						allLogs.WriteString(fmt.Sprintf("Error getting logs for init container %s: %v\n", initContainer.Name, err))
-						continue
-					}
-					allLogs.WriteString(fmt.Sprintf("\n[INIT] Container: %s\n", initContainer.Name))
-					allLogs.WriteString(initContainerLogs)
-					allLogs.WriteString("\n")
-				}
-			}
-		}
-	}
-
-	return allLogs.String(), nil
-}
-
-// getContainerLogs fetches logs from a specific container
-func (s *Server) getContainerLogs(ctx context.Context, namespace, podName, containerName string, tailLines int64, previous bool) (string, error) {
-	logOptions := &corev1.PodLogOptions{
-		Container: containerName,
-		TailLines: &tailLines,
-		Previous:  previous,
-	}
-
-	req := s.k8sClient.Clientset.CoreV1().Pods(namespace).GetLogs(podName, logOptions)
-	podLogs, err := req.Stream(ctx)
-	if err != nil {
-		return "", fmt.Errorf("error opening log stream: %w", err)
-	}
-	defer podLogs.Close()
-
-	var logs strings.Builder
-	reader := bufio.NewReader(podLogs)
-	for {
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			if line != "" {
-				logs.WriteString(line)
-			}
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("error reading logs: %w", err)
-		}
-		logs.WriteString(line)
-	}
-
-	return logs.String(), nil
-}
-
-// MarshalJSON implements custom JSON marshaling for the server
-func (s *Server) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
-		"name":    "Kubernetes Pod Logs Server",
-		"version": "1.0.0",
-	})
 }
