@@ -355,12 +355,40 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 
 			result.WriteString(strings.Repeat("-", 80) + "\n")
 
-			// Get logs from each container in the pod
+			// Collect all containers (init containers + regular containers)
+			type containerInfo struct {
+				name   string
+				isInit bool
+			}
+			var allContainers []containerInfo
+
+			// Add init containers first
+			for _, container := range pod.Spec.InitContainers {
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: true,
+				})
+			}
+
+			// Add regular containers
 			for _, container := range pod.Spec.Containers {
-				result.WriteString(fmt.Sprintf("\nContainer: %s\n", container.Name))
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: false,
+				})
+			}
+
+			// Get logs from each container in the pod
+			for _, container := range allContainers {
+				// Label init containers with [INIT] prefix
+				if container.isInit {
+					result.WriteString(fmt.Sprintf("\nContainer: [INIT] %s\n", container.name))
+				} else {
+					result.WriteString(fmt.Sprintf("\nContainer: %s\n", container.name))
+				}
 
 				logOptions := &corev1.PodLogOptions{
-					Container: container.Name,
+					Container: container.name,
 					TailLines: &tailLines,
 					Previous:  previous,
 				}
