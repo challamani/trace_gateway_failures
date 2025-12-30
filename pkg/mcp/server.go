@@ -1,35 +1,40 @@
 package mcp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// Server represents the MCP server
-type Server struct {
+type K8sServer struct {
 	clientset *kubernetes.Clientset
+	config    *rest.Config
 }
 
-// NewServer creates a new MCP server instance
-func NewServer() (*Server, error) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		// Fallback to kubeconfig
-		kubeconfig := clientcmd.NewDefaultClientConfigLoadingRules().GetDefaultFilename()
+func NewK8sServer(kubeconfig string) (*K8sServer, error) {
+	var config *rest.Config
+	var err error
+
+	if kubeconfig != "" {
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create kubernetes config: %w", err)
-		}
+	} else {
+		config, err = rest.InClusterConfig()
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes config: %w", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -37,231 +42,185 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("failed to create kubernetes clientset: %w", err)
 	}
 
-	return &Server{
+	return &K8sServer{
 		clientset: clientset,
+		config:    config,
 	}, nil
 }
 
-// Target represents a single log collection target
-type Target struct {
-	Namespace   string   `json:"namespace"`
-	Deployments []string `json:"deployments"`
-	TailLines   int64    `json:"tail_lines,omitempty"`
-}
+func (s *K8sServer) Start() error {
+	mcpServer := server.NewMCPServer(
+		"kubernetes-mcp-server",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
 
-// LogsRequest represents the request parameters for fetching logs
-type LogsRequest struct {
-	Targets  []Target `json:"targets"`
-	Previous bool     `json:"previous,omitempty"`
-}
+	listPodsToolName := "list_pods"
+	listPodsTool := mcp.NewTool(listPodsToolName,
+		mcp.WithDescription("List all pods in a specific namespace or all namespaces"),
+		mcp.WithString("namespace",
+			mcp.Required(),
+			mcp.Description("Namespace to list pods from, use 'all' for all namespaces"),
+		),
+	)
 
-// GetPodLogs fetches logs from pods based on the targets array
-func (s *Server) GetPodLogs(ctx context.Context, req LogsRequest) (string, error) {
-	var allLogs strings.Builder
+	getPodLogsTool := mcp.NewTool("get_pod_logs",
+		mcp.WithDescription("Get logs from a specific pod and container"),
+		mcp.WithString("namespace",
+			mcp.Required(),
+			mcp.Description("Namespace of the pod"),
+		),
+		mcp.WithString("pod",
+			mcp.Required(),
+			mcp.Description("Name of the pod"),
+		),
+		mcp.WithString("container",
+			mcp.Description("Name of the container (optional, uses first container if not specified)"),
+		),
+		mcp.WithNumber("tail_lines",
+			mcp.Description("Number of lines to tail (optional, defaults to 100)"),
+		),
+	)
 
-	for _, target := range req.Targets {
-		namespace := target.Namespace
-		if namespace == "" {
-			namespace = "default"
-		}
+	describePodTool := mcp.NewTool("describe_pod",
+		mcp.WithDescription("Get detailed information about a specific pod"),
+		mcp.WithString("namespace",
+			mcp.Required(),
+			mcp.Description("Namespace of the pod"),
+		),
+		mcp.WithString("pod",
+			mcp.Required(),
+			mcp.Description("Name of the pod"),
+		),
+	)
 
-		tailLines := target.TailLines
-		if tailLines == 0 {
-			tailLines = 100 // Default tail lines
-		}
+	mcpServer.AddTool(listPodsTool, s.handleListPods)
+	mcpServer.AddTool(getPodLogsTool, s.handleGetPodLogs)
+	mcpServer.AddTool(describePodTool, s.handleDescribePod)
 
-		for _, deploymentName := range target.Deployments {
-			// Get deployment to find pods
-			deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
-			if err != nil {
-				allLogs.WriteString(fmt.Sprintf("Error getting deployment %s in namespace %s: %v\n\n", deploymentName, namespace, err))
-				continue
-			}
-
-			// Get pods for this deployment
-			labelSelector := metav1.FormatLabelSelector(deployment.Spec.Selector)
-			pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: labelSelector,
-			})
-			if err != nil {
-				allLogs.WriteString(fmt.Sprintf("Error listing pods for deployment %s: %v\n\n", deploymentName, err))
-				continue
-			}
-
-			if len(pods.Items) == 0 {
-				allLogs.WriteString(fmt.Sprintf("No pods found for deployment %s in namespace %s\n\n", deploymentName, namespace))
-				continue
-			}
-
-			// Fetch logs from each pod
-			for _, pod := range pods.Items {
-				allLogs.WriteString(fmt.Sprintf("=== Logs from Pod: %s (Namespace: %s, Deployment: %s) ===\n", pod.Name, namespace, deploymentName))
-
-				// Get logs from init containers
-				for _, initContainer := range pod.Spec.InitContainers {
-					containerLogs, err := s.fetchContainerLogs(ctx, namespace, pod.Name, initContainer.Name, tailLines, req.Previous, true)
-					if err != nil {
-						allLogs.WriteString(fmt.Sprintf("[INIT] Container %s - Error: %v\n", initContainer.Name, err))
-					} else {
-						allLogs.WriteString(fmt.Sprintf("[INIT] Container: %s\n%s\n", initContainer.Name, containerLogs))
-					}
-				}
-
-				// Get logs from regular containers
-				for _, container := range pod.Spec.Containers {
-					containerLogs, err := s.fetchContainerLogs(ctx, namespace, pod.Name, container.Name, tailLines, req.Previous, false)
-					if err != nil {
-						allLogs.WriteString(fmt.Sprintf("Container %s - Error: %v\n", container.Name, err))
-					} else {
-						allLogs.WriteString(fmt.Sprintf("Container: %s\n%s\n", container.Name, containerLogs))
-					}
-				}
-
-				allLogs.WriteString("\n")
-			}
-		}
+	if err := mcpServer.Serve(); err != nil {
+		return fmt.Errorf("server error: %w", err)
 	}
 
-	if allLogs.Len() == 0 {
-		return "No logs found for the specified targets", nil
-	}
-
-	return allLogs.String(), nil
+	return nil
 }
 
-// fetchContainerLogs retrieves logs from a specific container in a pod
-func (s *Server) fetchContainerLogs(ctx context.Context, namespace, podName, containerName string, tailLines int64, previous, isInit bool) (string, error) {
-	podLogOpts := &metav1.PodLogOptions{
-		Container: containerName,
-		TailLines: &tailLines,
-		Previous:  previous,
+func (s *K8sServer) handleListPods(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	namespace := request.Params.Arguments["namespace"].(string)
+
+	if namespace == "all" {
+		namespace = ""
 	}
 
-	req := s.clientset.CoreV1().Pods(namespace).GetLogs(podName, podLogOpts)
-	podLogs, err := req.Stream(ctx)
+	pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to get log stream: %w", err)
-	}
-	defer podLogs.Close()
-
-	var logs strings.Builder
-	scanner := bufio.NewScanner(podLogs)
-	for scanner.Scan() {
-		logs.WriteString(scanner.Text())
-		logs.WriteString("\n")
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list pods: %v", err)), nil
 	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		return "", fmt.Errorf("error reading logs: %w", err)
+	result := make([]map[string]interface{}, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		result = append(result, map[string]interface{}{
+			"name":      pod.Name,
+			"namespace": pod.Namespace,
+			"status":    string(pod.Status.Phase),
+			"created":   pod.CreationTimestamp.Format(time.RFC3339),
+		})
 	}
 
-	return logs.String(), nil
+	jsonData, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(jsonData)), nil
 }
 
-// HandleToolCall processes MCP tool calls
-func (s *Server) HandleToolCall(toolName string, arguments map[string]interface{}) (interface{}, error) {
-	switch toolName {
-	case "get_pod_logs":
-		return s.handleGetPodLogs(arguments)
-	default:
-		return nil, fmt.Errorf("unknown tool: %s", toolName)
-	}
-}
+func (s *K8sServer) handleGetPodLogs(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	namespace := request.Params.Arguments["namespace"].(string)
+	podName := request.Params.Arguments["pod"].(string)
+	container, _ := request.Params.Arguments["container"].(string)
+	tailLines, _ := request.Params.Arguments["tail_lines"].(float64)
 
-// handleGetPodLogs processes the get_pod_logs tool call
-func (s *Server) handleGetPodLogs(arguments map[string]interface{}) (interface{}, error) {
-	// Parse arguments
-	var req LogsRequest
-
-	// Extract targets
-	targetsData, ok := arguments["targets"]
-	if !ok || targetsData == nil {
-		return nil, fmt.Errorf("targets parameter is required")
+	if tailLines == 0 {
+		tailLines = 100
 	}
 
-	// Convert to JSON and back to parse properly
-	targetsJSON, err := json.Marshal(targetsData)
+	tail := int64(tailLines)
+	logOptions := &corev1.PodLogOptions{
+		Container: container,
+		TailLines: &tail,
+	}
+
+	req := s.clientset.CoreV1().Pods(namespace).GetLogs(podName, logOptions)
+	logs, err := req.Stream(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal targets: %w", err)
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get pod logs: %v", err)), nil
+	}
+	defer logs.Close()
+
+	logData, err := io.ReadAll(logs)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to read pod logs: %v", err)), nil
 	}
 
-	if err := json.Unmarshal(targetsJSON, &req.Targets); err != nil {
-		return nil, fmt.Errorf("failed to parse targets: %w", err)
+	return mcp.NewToolResultText(string(logData)), nil
+}
+
+func (s *K8sServer) handleDescribePod(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	namespace := request.Params.Arguments["namespace"].(string)
+	podName := request.Params.Arguments["pod"].(string)
+
+	pod, err := s.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get pod: %v", err)), nil
 	}
 
-	// Extract previous flag
-	if previousVal, ok := arguments["previous"]; ok {
-		if previousBool, ok := previousVal.(bool); ok {
-			req.Previous = previousBool
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf("Name: %s\n", pod.Name))
+	output.WriteString(fmt.Sprintf("Namespace: %s\n", pod.Namespace))
+	output.WriteString(fmt.Sprintf("Status: %s\n", pod.Status.Phase))
+	output.WriteString(fmt.Sprintf("Created: %s\n", pod.CreationTimestamp.Format(time.RFC3339)))
+
+	if pod.Status.Message != "" {
+		output.WriteString(fmt.Sprintf("Message: %s\n", pod.Status.Message))
+	}
+
+	if pod.Status.Reason != "" {
+		output.WriteString(fmt.Sprintf("Reason: %s\n", pod.Status.Reason))
+	}
+
+	output.WriteString("\nContainers:\n")
+	for _, container := range pod.Spec.Containers {
+		output.WriteString(fmt.Sprintf("  - Name: %s\n", container.Name))
+		output.WriteString(fmt.Sprintf("    Image: %s\n", container.Image))
+	}
+
+	output.WriteString("\nContainer Statuses:\n")
+	for _, status := range pod.Status.ContainerStatuses {
+		output.WriteString(fmt.Sprintf("  - Name: %s\n", status.Name))
+		output.WriteString(fmt.Sprintf("    Ready: %v\n", status.Ready))
+		output.WriteString(fmt.Sprintf("    Restart Count: %d\n", status.RestartCount))
+
+		if status.State.Running != nil {
+			output.WriteString(fmt.Sprintf("    State: Running (started: %s)\n", status.State.Running.StartedAt.Format(time.RFC3339)))
+		} else if status.State.Waiting != nil {
+			output.WriteString(fmt.Sprintf("    State: Waiting (reason: %s)\n", status.State.Waiting.Reason))
+		} else if status.State.Terminated != nil {
+			output.WriteString(fmt.Sprintf("    State: Terminated (reason: %s, exit code: %d)\n",
+				status.State.Terminated.Reason, status.State.Terminated.ExitCode))
 		}
 	}
 
-	// Validate that we have at least one target
-	if len(req.Targets) == 0 {
-		return nil, fmt.Errorf("at least one target is required")
-	}
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	// Fetch logs
-	logs, err := s.GetPodLogs(ctx, req)
+	output.WriteString("\nEvents:\n")
+	events, err := s.clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s", podName),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get pod logs: %w", err)
+		log.Printf("failed to get events: %v", err)
+	} else {
+		for _, event := range events.Items {
+			output.WriteString(fmt.Sprintf("  - [%s] %s: %s\n",
+				event.LastTimestamp.Format(time.RFC3339),
+				event.Reason,
+				event.Message))
+		}
 	}
 
-	return map[string]interface{}{
-		"content": []map[string]interface{}{
-			{
-				"type": "text",
-				"text": logs,
-			},
-		},
-	}, nil
-}
-
-// GetToolDefinitions returns the MCP tool definitions
-func (s *Server) GetToolDefinitions() []map[string]interface{} {
-	return []map[string]interface{}{
-		{
-			"name":        "get_pod_logs",
-			"description": "Fetch logs from Kubernetes pods based on deployment names across multiple namespaces with init container support",
-			"inputSchema": map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"targets": map[string]interface{}{
-						"type":        "array",
-						"description": "Array of log collection targets, each specifying namespace, deployments, and tail lines",
-						"items": map[string]interface{}{
-							"type": "object",
-							"properties": map[string]interface{}{
-								"namespace": map[string]interface{}{
-									"type":        "string",
-									"description": "Kubernetes namespace (defaults to 'default' if not specified)",
-								},
-								"deployments": map[string]interface{}{
-									"type":        "array",
-									"description": "Array of deployment names to fetch logs from",
-									"items": map[string]interface{}{
-										"type": "string",
-									},
-								},
-								"tail_lines": map[string]interface{}{
-									"type":        "integer",
-									"description": "Number of lines to tail from the end of logs (defaults to 100 if not specified)",
-								},
-							},
-							"required": []string{"namespace", "deployments"},
-						},
-					},
-					"previous": map[string]interface{}{
-						"type":        "boolean",
-						"description": "If true, fetch logs from previous terminated container instances (globalCurrent Date: 2025-12-30 13:23:05)",
-					},
-				},
-				"required": []string{"targets"},
-			},
-		},
-	}
+	return mcp.NewToolResultText(output.String()), nil
 }
