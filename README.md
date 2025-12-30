@@ -1,63 +1,74 @@
-# trace_gateway_failures
+# Kubernetes Gateway Failure Tracing MCP Server
 
-MCP Server to retrieve Gateway logs and metrics to identify traffic failures. This server implements the Model Context Protocol (MCP) and provides tools to retrieve Kubernetes pod logs for analyzing where incoming traffic might be failing in your gateway infrastructure.
+An MCP (Model Context Protocol) server that helps trace and analyze Kubernetes gateway failures by providing intelligent log retrieval and analysis capabilities.
+
+## Overview
+
+This server exposes tools to:
+- Retrieve pod logs from multiple Kubernetes namespaces with deployment-specific filtering
+- Support for init containers (labeled with `[INIT]` prefix)
+- Analyze gateway-related failures across your Kubernetes infrastructure
+- Filter logs by deployment names within each namespace
+- Configure different tail line limits per namespace
 
 ## Features
 
-- **MCP Protocol Support**: Implements the Model Context Protocol for seamless integration with MCP clients
-- **Kubernetes Integration**: Uses the Kubernetes Go client library to interact with clusters
-- **Local Kubeconfig**: Automatically uses your local `~/.kube/config` for cluster authentication
-- **Flexible Filtering**: Filter pods by namespaces and deployment names
-- **Comprehensive Logging**: Retrieve logs from all matching pods and containers
-- **Gateway Failure Analysis**: Designed to help trace where incoming traffic is failing across your infrastructure
-
-## Prerequisites
-
-- Go 1.21 or later
-- Access to a Kubernetes cluster
-- Valid kubeconfig file at `~/.kube/config`
-- Appropriate RBAC permissions to list pods and read logs in target namespaces
+- 🔍 **Multi-namespace log retrieval** with namespace-scoped deployment filtering
+- 🎯 **Deployment-specific filtering** - specify which deployments to monitor per namespace
+- 🔧 **Init container support** - automatically detects and labels init containers
+- 📊 **Structured log output** with clear pod, container, and namespace separation
+- ⚙️ **Flexible configuration** - different tail line limits per namespace
+- 🔄 **Previous container logs** support for troubleshooting crashed containers
+- 🚀 **Built with MCP SDK** for seamless AI assistant integration
 
 ## Installation
 
-### Build from Source
+### Prerequisites
+
+- Python 3.10 or higher
+- Access to a Kubernetes cluster with valid `kubectl` configuration
+- `kubectl` command-line tool installed and configured
+
+### Install from Source
 
 ```bash
 # Clone the repository
 git clone https://github.com/challamani/trace_gateway_failures.git
 cd trace_gateway_failures
 
-# Build the server
-go build -o mcp-server .
-
-# Run the server
-./mcp-server
-```
-
-### Direct Run
-
-```bash
-go run main.go
+# Install the package
+pip install -e .
 ```
 
 ## Usage
 
-The MCP server communicates via stdin/stdout using the JSON-RPC 2.0 protocol. It can be integrated with any MCP client.
+### Running the Server
+
+You can run the server using either `stdio` or `sse` transport:
+
+```bash
+# Using stdio transport (default)
+python -m trace_gateway_failures
+
+# Using SSE transport
+python -m trace_gateway_failures --transport sse
+```
 
 ### Available Tools
 
 #### `get_pod_logs`
 
-Retrieves pod logs for given namespaces and deployment names to trace gateway failures.
+Retrieves pod logs for given namespaces and deployment names to trace gateway failures. **Now supports init containers** (labeled with `[INIT]` prefix) and **namespace-scoped deployment filtering**.
 
 **Parameters:**
 
-- `namespaces` (array of strings, required): List of Kubernetes namespaces to search for pods
-- `deployments` (array of strings, optional): List of deployment names to filter pods. If not provided, all pods in the namespace are included
-- `tail_lines` (integer, optional, default: 100): Number of lines from the end of the logs to retrieve
+- `namespaces` (array of objects, required): Array of namespace configurations
+  - `name` (string, required): Kubernetes namespace name
+  - `deployments` (array of strings, required): List of deployment names to filter pods in this namespace
+  - `tail_lines` (integer, optional, default: 100): Number of lines from the end of logs for this namespace
 - `previous` (boolean, optional, default: false): Retrieve logs from previous terminated container
 
-**Example Request:**
+**Example Request - Single Namespace:**
 
 ```json
 {
@@ -67,9 +78,41 @@ Retrieves pod logs for given namespaces and deployment names to trace gateway fa
   "params": {
     "name": "get_pod_logs",
     "arguments": {
-      "namespaces": ["default", "kube-system"],
-      "deployments": ["nginx", "gateway"],
-      "tail_lines": 200,
+      "namespaces": [
+        {
+          "name": "production",
+          "deployments": ["api-gateway", "auth-service"],
+          "tail_lines": 200
+        }
+      ],
+      "previous": false
+    }
+  }
+}
+```
+
+**Example Request - Multiple Namespaces with Different Configurations:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_pod_logs",
+    "arguments": {
+      "namespaces": [
+        {
+          "name": "production",
+          "deployments": ["api-gateway"],
+          "tail_lines": 500
+        },
+        {
+          "name": "staging",
+          "deployments": ["api-gateway", "payment-service"],
+          "tail_lines": 100
+        }
+      ],
       "previous": false
     }
   }
@@ -81,131 +124,157 @@ Retrieves pod logs for given namespaces and deployment names to trace gateway fa
 The tool returns formatted logs showing:
 - Namespace and pod information
 - Pod status and owner references (Deployment/ReplicaSet)
-- Logs from each container in the pod
+- **Init container logs with `[INIT]` prefix** (e.g., `[INIT] istio-init`)
+- Logs from all regular containers (including sidecars like `istio-proxy`)
 - Clear separation between different pods and containers
 
-## MCP Protocol Support
+**Sample Output:**
+```
+=== Pod Logs Analysis for Gateway Failure Tracing ===
 
-The server implements the following MCP methods:
+Namespace: production
+================================================================================
 
-- `initialize`: Initialize the MCP connection
-- `tools/list`: List available tools
-- `tools/call`: Execute a specific tool
+Pod: api-gateway-7d8f9c5b6-x4k2m (Status: Running)
+Owner: ReplicaSet/api-gateway-7d8f9c5b6
+--------------------------------------------------------------------------------
+
+Container: [INIT] istio-init
+2025-12-30T15:10:15Z Initializing iptables rules
+2025-12-30T15:10:16Z iptables configuration completed
+
+Container: api-gateway
+2025-12-30T15:10:30Z Server started on port 8080
+2025-12-30T15:11:00Z Processing request GET /api/v1/status
+
+Container: istio-proxy
+2025-12-30T15:10:20Z Envoy proxy initialized
+2025-12-30T15:11:00Z [outbound] upstream connect to backend-service:8080
+```
+
+## Integration with AI Assistants
+
+### Claude Desktop Configuration
+
+Add to your Claude Desktop configuration file:
+
+**MacOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "trace_gateway_failures": {
+      "command": "python",
+      "args": ["-m", "trace_gateway_failures"]
+    }
+  }
+}
+```
+
+### Example Workflow
+
+1. **Ask Claude to investigate gateway failures:**
+   ```
+   "Check the logs for api-gateway and auth-service deployments in the production 
+   namespace for any errors in the last 200 lines"
+   ```
+
+2. **Claude will use the tool with the new format:**
+   ```json
+   {
+     "namespaces": [
+       {
+         "name": "production",
+         "deployments": ["api-gateway", "auth-service"],
+         "tail_lines": 200
+       }
+     ]
+   }
+   ```
+
+3. **Analyze results across multiple namespaces:**
+   ```
+   "Compare the gateway logs between production and staging environments, 
+   focusing on the api-gateway deployment"
+   ```
 
 ## Architecture
 
 ```
-main.go
-└── pkg/mcp/
-    └── server.go
-        ├── Server: Main server structure
-        ├── StdioTransport: Handles stdio communication
-        ├── InitializeKubeClient(): Initializes Kubernetes client
-        ├── Start(): Starts the server loop
-        ├── handleRequest(): Routes MCP requests
-        └── getPodLogs(): Retrieves and formats pod logs
-```
-
-## Use Case: Tracing Gateway Failures
-
-This tool is designed to help identify where incoming traffic is failing in your Kubernetes infrastructure:
-
-1. **Multi-Hop Analysis**: Check logs across multiple namespaces to trace the request path
-2. **Deployment Filtering**: Focus on specific gateway deployments (e.g., ingress controllers, API gateways)
-3. **Error Pattern Detection**: Review logs from multiple pods to identify common failure patterns
-4. **Recent History**: Use `tail_lines` to focus on recent events
-5. **Crash Analysis**: Use `previous: true` to examine logs from crashed containers
-
-### Example Workflow
-
-```bash
-# Check gateway and upstream service logs
-echo '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "get_pod_logs",
-    "arguments": {
-      "namespaces": ["ingress-nginx", "api-gateway", "backend-services"],
-      "deployments": ["nginx-ingress", "api-gateway", "user-service"],
-      "tail_lines": 500
-    }
-  }
-}' | ./mcp-server
-```
-
-## Configuration
-
-The server uses the default kubeconfig location (`~/.kube/config`). No additional configuration is required as it runs on localhost and uses local kubeconfig for cluster authentication.
-
-### RBAC Requirements
-
-Ensure your kubeconfig user has the following permissions:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: pod-logs-reader
-rules:
-- apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list"]
+┌─────────────────────────────────────────────────────────┐
+│                    AI Assistant (Claude)                 │
+└────────────────────┬────────────────────────────────────┘
+                     │ MCP Protocol
+                     │
+┌────────────────────▼────────────────────────────────────┐
+│         Trace Gateway Failures MCP Server               │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  Tools:                                          │  │
+│  │  - get_pod_logs (namespace + deployment filter) │  │
+│  │  - init container detection                     │  │
+│  └──────────────────────────────────────────────────┘  │
+└────────────────────┬────────────────────────────────────┘
+                     │ kubectl commands
+                     │
+┌────────────────────▼────────────────────────────────────┐
+│              Kubernetes Cluster                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │ Namespace 1 │  │ Namespace 2 │  │ Namespace N │    │
+│  │ - Pods      │  │ - Pods      │  │ - Pods      │    │
+│  │ - Init Ctrs │  │ - Init Ctrs │  │ - Init Ctrs │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## Development
 
 ### Project Structure
 
-- `main.go`: Entry point for the MCP server
-- `pkg/mcp/server.go`: Core MCP server implementation with Kubernetes integration
-- `go.mod`: Go module dependencies
+```
+trace_gateway_failures/
+├── src/
+│   └── trace_gateway_failures/
+│       ├── __init__.py
+│       ├── __main__.py
+│       └── server.py
+├── pyproject.toml
+└── README.md
+```
 
-### Dependencies
-
-- `k8s.io/client-go`: Kubernetes Go client library
-- `k8s.io/api`: Kubernetes API types
-- `k8s.io/apimachinery`: Kubernetes API machinery
-
-### Testing
-
-To test the server manually:
+### Running Tests
 
 ```bash
-# Start the server
-./mcp-server
-
-# In another terminal, send requests via stdin
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ./mcp-server
+# Run the server in debug mode
+python -m trace_gateway_failures --transport stdio
 ```
+
+### Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Troubleshooting
 
-### "Failed to initialize Kubernetes client"
+### kubectl Not Found
+Ensure `kubectl` is installed and available in your system PATH.
 
-- Ensure your kubeconfig file exists at `~/.kube/config`
-- Verify the kubeconfig is valid and points to an accessible cluster
-- Check that you have network connectivity to the cluster
+### Permission Denied
+Verify your Kubernetes configuration has appropriate RBAC permissions to read pods and logs.
 
-### "Error listing pods in namespace X"
-
-- Verify the namespace exists: `kubectl get namespace`
-- Check RBAC permissions for your user
-- Ensure the cluster is reachable
-
-### "No pods found matching deployments"
-
+### No Logs Retrieved
+- Check if pods exist in the specified namespaces
 - Verify deployment names are correct
-- The tool matches pods by:
-  - `app` label matching deployment name
-  - Pod name containing deployment name
-  - Owner references (ReplicaSet) starting with deployment name
+- Ensure pods are in Running state or have terminated containers for previous logs
 
 ## License
 
-MIT License
+[Add your license here]
 
-## Contributing
+## Author
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Challamani - [GitHub Profile](https://github.com/challamani)
+
+## Acknowledgments
+
+- Built with [Model Context Protocol SDK](https://github.com/modelcontextprotocol)
+- Kubernetes log retrieval powered by `kubectl`

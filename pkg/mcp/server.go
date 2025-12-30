@@ -82,6 +82,13 @@ type MCPError struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+// NamespaceConfig represents configuration for a single namespace
+type NamespaceConfig struct {
+	Name        string   `json:"name"`
+	Deployments []string `json:"deployments"`
+	TailLines   int64    `json:"tail_lines,omitempty"`
+}
+
 // Start starts the MCP server with the given transport
 func (s *Server) Start(transport *StdioTransport) error {
 	scanner := bufio.NewScanner(transport.Reader)
@@ -157,28 +164,35 @@ func (s *Server) handleToolsList(req *MCPRequest) *MCPResponse {
 	tools := []map[string]interface{}{
 		{
 			"name":        "get_pod_logs",
-			"description": "Retrieve pod logs for given namespaces and deployment names to trace gateway failures",
+			"description": "Retrieve pod logs for given namespaces and deployment names to trace gateway failures. Supports init containers with [INIT] prefix.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"namespaces": map[string]interface{}{
 						"type":        "array",
-						"description": "List of Kubernetes namespaces to search for pods",
+						"description": "Array of namespace configurations with deployments and optional tail_lines",
 						"items": map[string]interface{}{
-							"type": "string",
+							"type": "object",
+							"properties": map[string]interface{}{
+								"name": map[string]interface{}{
+									"type":        "string",
+									"description": "Kubernetes namespace name",
+								},
+								"deployments": map[string]interface{}{
+									"type":        "array",
+									"description": "List of deployment names to filter pods in this namespace",
+									"items": map[string]interface{}{
+										"type": "string",
+									},
+								},
+								"tail_lines": map[string]interface{}{
+									"type":        "integer",
+									"description": "Number of lines from the end of logs for this namespace (default: 100)",
+									"default":     100,
+								},
+							},
+							"required": []string{"name", "deployments"},
 						},
-					},
-					"deployments": map[string]interface{}{
-						"type":        "array",
-						"description": "List of deployment names to filter pods",
-						"items": map[string]interface{}{
-							"type": "string",
-						},
-					},
-					"tail_lines": map[string]interface{}{
-						"type":        "integer",
-						"description": "Number of lines from the end of the logs to retrieve (default: 100)",
-						"default":     100,
 					},
 					"previous": map[string]interface{}{
 						"type":        "boolean",
@@ -236,30 +250,38 @@ func (s *Server) handleToolsCall(req *MCPRequest) *MCPResponse {
 	}
 }
 
-// handleGetPodLogs retrieves pod logs based on namespaces and deployments
+// handleGetPodLogs retrieves pod logs based on namespace configurations
 func (s *Server) handleGetPodLogs(req *MCPRequest, args map[string]interface{}) *MCPResponse {
-	// Parse arguments
-	var namespaces []string
-	if ns, ok := args["namespaces"].([]interface{}); ok {
-		for _, n := range ns {
-			if nsStr, ok := n.(string); ok {
-				namespaces = append(namespaces, nsStr)
+	// Parse namespaces array
+	var namespaceConfigs []NamespaceConfig
+	if nsArray, ok := args["namespaces"].([]interface{}); ok {
+		for _, nsItem := range nsArray {
+			if nsMap, ok := nsItem.(map[string]interface{}); ok {
+				config := NamespaceConfig{
+					TailLines: 100, // default
+				}
+
+				if name, ok := nsMap["name"].(string); ok {
+					config.Name = name
+				}
+
+				if depsArray, ok := nsMap["deployments"].([]interface{}); ok {
+					for _, dep := range depsArray {
+						if depStr, ok := dep.(string); ok {
+							config.Deployments = append(config.Deployments, depStr)
+						}
+					}
+				}
+
+				if tailLines, ok := nsMap["tail_lines"].(float64); ok {
+					config.TailLines = int64(tailLines)
+				}
+
+				if config.Name != "" && len(config.Deployments) > 0 {
+					namespaceConfigs = append(namespaceConfigs, config)
+				}
 			}
 		}
-	}
-
-	var deployments []string
-	if deps, ok := args["deployments"].([]interface{}); ok {
-		for _, d := range deps {
-			if depStr, ok := d.(string); ok {
-				deployments = append(deployments, depStr)
-			}
-		}
-	}
-
-	tailLines := int64(100)
-	if tl, ok := args["tail_lines"].(float64); ok {
-		tailLines = int64(tl)
 	}
 
 	previous := false
@@ -267,19 +289,19 @@ func (s *Server) handleGetPodLogs(req *MCPRequest, args map[string]interface{}) 
 		previous = prev
 	}
 
-	if len(namespaces) == 0 {
+	if len(namespaceConfigs) == 0 {
 		return &MCPResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Error: &MCPError{
 				Code:    -32602,
-				Message: "At least one namespace is required",
+				Message: "At least one valid namespace configuration is required",
 			},
 		}
 	}
 
 	// Retrieve logs
-	logsResult, err := s.getPodLogs(namespaces, deployments, tailLines, previous)
+	logsResult, err := s.getPodLogs(namespaceConfigs, previous)
 	if err != nil {
 		return &MCPResponse{
 			JSONRPC: "2.0",
@@ -307,7 +329,7 @@ func (s *Server) handleGetPodLogs(req *MCPRequest, args map[string]interface{}) 
 }
 
 // getPodLogs retrieves logs from pods matching the criteria
-func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines int64, previous bool) (string, error) {
+func (s *Server) getPodLogs(namespaceConfigs []NamespaceConfig, previous bool) (string, error) {
 	if s.clientset == nil {
 		return "", fmt.Errorf("Kubernetes client not initialized - ensure valid kubeconfig is available")
 	}
@@ -317,7 +339,11 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 
 	result.WriteString("=== Pod Logs Analysis for Gateway Failure Tracing ===\n\n")
 
-	for _, namespace := range namespaces {
+	for _, nsConfig := range namespaceConfigs {
+		namespace := nsConfig.Name
+		deployments := nsConfig.Deployments
+		tailLines := nsConfig.TailLines
+
 		result.WriteString(fmt.Sprintf("Namespace: %s\n", namespace))
 		result.WriteString(strings.Repeat("=", 80) + "\n\n")
 
@@ -337,9 +363,7 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 		filteredPods := s.filterPodsByDeployment(pods.Items, deployments)
 
 		if len(filteredPods) == 0 {
-			if len(deployments) > 0 {
-				result.WriteString(fmt.Sprintf("No pods found matching deployments %v in namespace %s\n\n", deployments, namespace))
-			}
+			result.WriteString(fmt.Sprintf("No pods found matching deployments %v in namespace %s\n\n", deployments, namespace))
 			continue
 		}
 
@@ -355,12 +379,40 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 
 			result.WriteString(strings.Repeat("-", 80) + "\n")
 
-			// Get logs from each container in the pod
+			// Collect all containers (init + regular)
+			type containerInfo struct {
+				name   string
+				isInit bool
+			}
+			allContainers := make([]containerInfo, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+
+			// Add init containers first
+			for _, container := range pod.Spec.InitContainers {
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: true,
+				})
+			}
+
+			// Add regular containers
 			for _, container := range pod.Spec.Containers {
-				result.WriteString(fmt.Sprintf("\nContainer: %s\n", container.Name))
+				allContainers = append(allContainers, containerInfo{
+					name:   container.Name,
+					isInit: false,
+				})
+			}
+
+			// Get logs from each container
+			for _, container := range allContainers {
+				// Label init containers with [INIT] prefix
+				if container.isInit {
+					result.WriteString(fmt.Sprintf("\nContainer: [INIT] %s\n", container.name))
+				} else {
+					result.WriteString(fmt.Sprintf("\nContainer: %s\n", container.name))
+				}
 
 				logOptions := &corev1.PodLogOptions{
-					Container: container.Name,
+					Container: container.name,
 					TailLines: &tailLines,
 					Previous:  previous,
 				}
