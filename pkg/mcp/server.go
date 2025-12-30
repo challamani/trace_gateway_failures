@@ -360,7 +360,7 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 				name   string
 				isInit bool
 			}
-			var allContainers []containerInfo
+			allContainers := make([]containerInfo, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 
 			// Add init containers first
 			for _, container := range pod.Spec.InitContainers {
