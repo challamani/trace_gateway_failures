@@ -1,0 +1,117 @@
+# MCP Server Demo Output
+
+## 1. Initialize Request and Response
+
+Request:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+
+Response:
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"trace_gateway_failures","version":"1.0.0"}}}
+
+## 2. Tools List Request and Response
+
+Request:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+Response:
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "get_pod_logs",
+        "description": "Retrieve pod logs for given namespaces and deployment names to trace gateway failures",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "namespaces": {
+              "type": "array",
+              "description": "List of Kubernetes namespaces to search for pods",
+              "items": {"type": "string"}
+            },
+            "deployments": {
+              "type": "array",
+              "description": "List of deployment names to filter pods",
+              "items": {"type": "string"}
+            },
+            "tail_lines": {
+              "type": "integer",
+              "description": "Number of lines from the end of the logs to retrieve (default: 100)",
+              "default": 100
+            },
+            "previous": {
+              "type": "boolean",
+              "description": "Retrieve logs from previous terminated container (default: false)",
+              "default": false
+            }
+          },
+          "required": ["namespaces"]
+        }
+      }
+    ]
+  }
+}
+
+## 3. Get Pod Logs Request (Example)
+
+Request:
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "get_pod_logs",
+    "arguments": {
+      "namespaces": ["default", "kube-system"],
+      "deployments": ["nginx", "coredns"],
+      "tail_lines": 100
+    }
+  }
+}
+
+Expected Response Format:
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "=== Pod Logs Analysis for Gateway Failure Tracing ===\n\nNamespace: default\n...[pod logs]..."
+      }
+    ]
+  }
+}
+
+## Use Cases
+
+### 1. Trace Ingress to Backend Flow
+Check logs across ingress controller, API gateway, and backend services:
+```json
+{
+  "namespaces": ["ingress-nginx", "api-gateway", "backend"],
+  "deployments": ["nginx-ingress", "gateway", "user-service"],
+  "tail_lines": 500
+}
+```
+
+### 2. Debug Crashed Pods
+Get logs from previous terminated containers:
+```json
+{
+  "namespaces": ["production"],
+  "deployments": ["failing-app"],
+  "previous": true,
+  "tail_lines": 1000
+}
+```
+
+### 3. Multi-Namespace Analysis
+Examine logs across entire infrastructure:
+```json
+{
+  "namespaces": ["default", "kube-system", "monitoring", "apps"],
+  "tail_lines": 200
+}
+```
