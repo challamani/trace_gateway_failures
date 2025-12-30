@@ -372,7 +372,9 @@ func (s *Server) getPodLogs(namespaces []string, deployments []string, tailLines
 				}
 
 				logBytes, err := io.ReadAll(logs)
-				logs.Close()
+				if closeErr := logs.Close(); closeErr != nil {
+					log.Printf("Error closing log stream: %v", closeErr)
+				}
 				if err != nil {
 					result.WriteString(fmt.Sprintf("Error reading logs: %v\n", err))
 					continue
@@ -451,5 +453,7 @@ func (s *Server) sendError(encoder *json.Encoder, id interface{}, code int, mess
 			Data:    data,
 		},
 	}
-	encoder.Encode(response)
+	if err := encoder.Encode(response); err != nil {
+		log.Printf("Failed to send error response: %v", err)
+	}
 }
