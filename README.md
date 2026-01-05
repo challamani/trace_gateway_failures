@@ -25,7 +25,6 @@ This server exposes tools to:
 
 ### Prerequisites
 
-- Python 3.10 or higher
 - Access to a Kubernetes cluster with valid `kubectl` configuration
 - `kubectl` command-line tool installed and configured
 
@@ -33,11 +32,14 @@ This server exposes tools to:
 
 ```bash
 # Clone the repository
-git clone https://github.com/challamani/trace_gateway_failures.git
-cd trace_gateway_failures
+git clone https://github.com/challamani/trace-gateway-failures.git
+cd trace-gateway-failures
 
-# Install the package
-pip install -e .
+# Build the server
+go build -o mcp-server .
+
+# Run the server
+./mcp-server
 ```
 
 ## Usage
@@ -48,10 +50,10 @@ You can run the server using either `stdio` or `sse` transport:
 
 ```bash
 # Using stdio transport (default)
-python -m trace_gateway_failures
+./mcp-server --transport stdio
 
 # Using SSE transport
-python -m trace_gateway_failures --transport sse
+./mcp-server --transport sse
 ```
 
 ### Available Tools
@@ -158,15 +160,16 @@ Container: istio-proxy
 
 Add to your Claude Desktop configuration file:
 
-**MacOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+**MacOS**: `~/Library/Application\ Support/Code/User/globalStorage/github.copilot-chat/mcp.json`
 **Windows**: `%APPDATA%/Claude/claude_desktop_config.json`
 
 ```json
 {
-  "mcpServers": {
+  "mcpServers":  {
     "trace_gateway_failures": {
-      "command": "python",
-      "args": ["-m", "trace_gateway_failures"]
+      "command":  "/Users/mani/workspace/trace-gateway-failures/mcp-server",
+      "args": [],
+      "env": {}
     }
   }
 }
@@ -232,13 +235,12 @@ Add to your Claude Desktop configuration file:
 ### Project Structure
 
 ```
-trace_gateway_failures/
-├── src/
-│   └── trace_gateway_failures/
-│       ├── __init__.py
-│       ├── __main__.py
-│       └── server.py
-├── pyproject.toml
+trace-gateway-failures/
+├── pkg/
+│   └──mcp/ 
+│       └── server.go
+├── go.mod
+├── main.go
 └── README.md
 ```
 
@@ -246,7 +248,7 @@ trace_gateway_failures/
 
 ```bash
 # Run the server in debug mode
-python -m trace_gateway_failures --transport stdio
+./mcp-server --transport stdio
 ```
 
 ### Contributing

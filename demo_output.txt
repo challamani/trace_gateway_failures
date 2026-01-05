@@ -6,7 +6,7 @@ Request:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 
 Response:
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"trace_gateway_failures","version":"1.0.0"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"trace-gateway-failures","version":"1.0.0"}}}
 
 ## 2. Tools List Request and Response
 

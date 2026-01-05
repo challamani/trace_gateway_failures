@@ -152,7 +152,7 @@ func (s *Server) handleInitialize(req *MCPRequest) *MCPResponse {
 				"tools": map[string]interface{}{},
 			},
 			"serverInfo": map[string]interface{}{
-				"name":    "trace_gateway_failures",
+				"name":    "trace-gateway-failures",
 				"version": "1.0.0",
 			},
 		},

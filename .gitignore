@@ -17,7 +17,7 @@ go.work
 # Build artifacts
 /bin/
 /dist/
-trace_gateway_failures
+trace-gateway-failures
 mcp-server
 
 # IDE and editor files

@@ -1,4 +1,4 @@
-module github.com/challamani/trace_gateway_failures
+module github.com/challamani/trace-gateway-failures
 
 go 1.24.11
 

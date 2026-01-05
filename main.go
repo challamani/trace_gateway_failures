@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/challamani/trace_gateway_failures/pkg/mcp"
+	"github.com/challamani/trace-gateway-failures/pkg/mcp"
 )
 
 func main() {
